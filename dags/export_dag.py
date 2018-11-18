@@ -105,6 +105,7 @@ output_bucket = os.environ.get('OUTPUT_BUCKET')
 if output_bucket is None:
     raise ValueError('You must set OUTPUT_BUCKET environment variable')
 web3_provider_uri = os.environ.get('WEB3_PROVIDER_URI', 'https://mainnet.infura.io/')
+web3_provider_uri_backup = os.environ.get('WEB3_PROVIDER_URI_BACKUP', web3_provider_uri)
 web3_provider_uri_archival = os.environ.get('WEB3_PROVIDER_URI_ARCHIVAL', web3_provider_uri)
 ethereumetl_repo_branch = os.environ.get('ETHEREUMETL_REPO_BRANCH', 'master')
 dags_folder = os.environ.get('DAGS_FOLDER', '/home/airflow/gcs/dags')
@@ -117,6 +118,7 @@ environment = {
     'EXECUTION_DATE': '{{ ds }}',
     'ETHEREUMETL_REPO_BRANCH': ethereumetl_repo_branch,
     'WEB3_PROVIDER_URI': web3_provider_uri,
+    'WEB3_PROVIDER_URI_BACKUP': web3_provider_uri_backup,
     'WEB3_PROVIDER_URI_ARCHIVAL': web3_provider_uri_archival,
     'OUTPUT_BUCKET': output_bucket,
     'DAGS_FOLDER': dags_folder,
@@ -125,20 +127,37 @@ environment = {
 }
 
 
-def add_export_task(toggle, task_id, bash_command, dependencies=None):
+def add_export_task(toggle, task_id, bash_command, dependencies=None, with_backup=True):
     if toggle:
-        operator = bash_operator.BashOperator(
-            task_id=task_id,
-            bash_command=bash_command,
-            execution_timeout=timedelta(hours=15),
-            env=environment,
-            dag=dag
-        )
+        def add_task(task_id, bash_command):
+            return bash_operator.BashOperator(
+                task_id=task_id,
+                bash_command=bash_command,
+                execution_timeout=timedelta(hours=15),
+                env=environment,
+                dag=dag
+            )
+
+        operator = add_task(
+            task_id, bash_command)
+        result_operator = operator
+        if with_backup:
+            backup_operator = add_task(
+                task_id + '_backup', bash_command.replace('$WEB3_PROVIDER_URI', '$WEB3_PROVIDER_URI_BACKUP'))
+            operator >> backup_operator
+            backup_operator.trigger_rule = 'one_failed'
+
+            result_operator = add_task(
+                task_id + '_result', 'echo "dummy success"')
+            operator >> result_operator
+            backup_operator >> result_operator
+            result_operator.trigger_rule = 'one_success'
+
         if dependencies is not None and len(dependencies) > 0:
             for dependency in dependencies:
                 if dependency is not None:
                     dependency >> operator
-        return operator
+        return result_operator
     else:
         return None
 
@@ -170,4 +189,4 @@ extract_token_transfers_operator = add_export_task(
     dependencies=[export_receipts_and_logs_operator])
 
 export_traces_operator = add_export_task(
-    export_traces, 'export_traces', export_traces_command)
+    export_traces, 'export_traces', export_traces_command, with_backup=False)

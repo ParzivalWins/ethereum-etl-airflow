@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 from airflow import models
 from airflow.contrib.operators.bigquery_operator import BigQueryOperator
 from airflow.contrib.sensors.gcs_sensor import GoogleCloudStorageObjectSensor
-from airflow.operators import bash_operator
 from airflow.operators.email_operator import EmailOperator
 from airflow.operators.python_operator import PythonOperator
 from google.cloud import bigquery
@@ -17,6 +16,7 @@ from google.cloud.bigquery import TimePartitioning
 
 logging.basicConfig()
 logging.getLogger().setLevel(logging.DEBUG)
+
 
 # The following datasets must be created in BigQuery:
 # - ethereum_blockchain_raw
@@ -31,6 +31,9 @@ dataset_name_temp = os.environ.get('DATASET_NAME_TEMP', 'ethereum_blockchain_tem
 destination_dataset_project_id = os.environ.get('DESTINATION_DATASET_PROJECT_ID')
 if not destination_dataset_project_id:
     raise ValueError('DESTINATION_DATASET_PROJECT_ID is required')
+
+copy_dataset_project_id = os.environ.get('COPY_DATASET_PROJECT_ID', '')
+copy_dataset_name = os.environ.get('COPY_DATASET_NAME', '')
 
 environment = {
     'DATASET_NAME': dataset_name,
@@ -97,10 +100,10 @@ dag = models.DAG(
     default_args=default_dag_args)
 
 dags_folder = os.environ.get('DAGS_FOLDER', '/home/airflow/gcs/dags')
-output_bucket = os.environ.get('OUTPUT_BUCKET')
 
 
 def add_load_tasks(task, file_format, allow_quoted_newlines=False):
+    output_bucket = os.environ.get('OUTPUT_BUCKET')
     if output_bucket is None:
         raise ValueError('You must set OUTPUT_BUCKET environment variable')
 
@@ -183,12 +186,17 @@ def add_enrich_tasks(task, time_partitioning_field='block_timestamp', dependenci
         copy_job_config = bigquery.CopyJobConfig()
         copy_job_config.write_disposition = 'WRITE_TRUNCATE'
 
-        dest_table_name = '{task}'.format(task=task)
-        project = os.environ.get('DESTINATION_DATASET_PROJECT_ID', None)
-        dest_table_ref = client.dataset(dataset_name, project=project).table(dest_table_name)
-        copy_job = client.copy_table(temp_table_ref, dest_table_ref, location='US', job_config=copy_job_config)
-        submit_bigquery_job(copy_job, copy_job_config)
-        assert copy_job.state == 'DONE'
+        all_destination_projects = [(destination_dataset_project_id, dataset_name)]
+        if copy_dataset_project_id is not None and len(copy_dataset_project_id) > 0 \
+                and copy_dataset_name is not None and len(copy_dataset_name) > 0:
+            all_destination_projects.append((copy_dataset_project_id, copy_dataset_name))
+
+        for dest_project, dest_dataset_name in all_destination_projects:
+            dest_table_name = '{task}'.format(task=task)
+            dest_table_ref = client.dataset(dest_dataset_name, project=dest_project).table(dest_table_name)
+            copy_job = client.copy_table(temp_table_ref, dest_table_ref, location='US', job_config=copy_job_config)
+            submit_bigquery_job(copy_job, copy_job_config)
+            assert copy_job.state == 'DONE'
 
         # Delete temp table
         client.delete_table(temp_table_ref)
@@ -260,29 +268,6 @@ verify_traces_transactions_count_task = add_verify_tasks(
 verify_traces_contracts_count_task = add_verify_tasks(
     'traces_contracts_count', [enrich_transactions_task, enrich_traces_task])
 
-save_checkmark_task = bash_operator.BashOperator(
-    task_id='save_checkmark',
-    bash_command='touch checkmark.txt && ' 
-                 'gsutil cp checkmark.txt gs://{bucket}/load/checkmarks/block_date={datestamp}/checkmark.txt'
-        .format(bucket=output_bucket, datestamp='{{ds}}'),
-    execution_timeout=timedelta(minutes=10),
-    env=environment,
-    dag=dag
-)
-
-verify_blocks_count_task >> save_checkmark_task
-verify_blocks_have_latest_task >> save_checkmark_task
-verify_transactions_count_task >> save_checkmark_task
-verify_transactions_have_latest_task >> save_checkmark_task
-verify_logs_have_latest_task >> save_checkmark_task
-verify_token_transfers_have_latest_task >> save_checkmark_task
-verify_traces_blocks_count_task >> save_checkmark_task
-verify_traces_transactions_count_task >> save_checkmark_task
-verify_traces_contracts_count_task >> save_checkmark_task
-
-enrich_tokens_task >> save_checkmark_task
-enrich_contracts_task >> save_checkmark_task
-
 if notification_emails and len(notification_emails) > 0:
     send_email_task = EmailOperator(
         task_id='send_email',
@@ -291,4 +276,15 @@ if notification_emails and len(notification_emails) > 0:
         html_content='Ethereum ETL Airflow Load DAG Succeeded',
         dag=dag
     )
-    save_checkmark_task >> send_email_task
+    verify_blocks_count_task >> send_email_task
+    verify_blocks_have_latest_task >> send_email_task
+    verify_transactions_count_task >> send_email_task
+    verify_transactions_have_latest_task >> send_email_task
+    verify_logs_have_latest_task >> send_email_task
+    verify_token_transfers_have_latest_task >> send_email_task
+    verify_traces_blocks_count_task >> send_email_task
+    verify_traces_transactions_count_task >> send_email_task
+    verify_traces_contracts_count_task >> send_email_task
+
+    enrich_tokens_task >> send_email_task
+    enrich_contracts_task >> send_email_task

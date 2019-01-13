@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from airflow import models
 from airflow.contrib.operators.bigquery_operator import BigQueryOperator
 from airflow.contrib.sensors.gcs_sensor import GoogleCloudStorageObjectSensor
+from airflow.operators import bash_operator
 from airflow.operators.email_operator import EmailOperator
 from airflow.operators.python_operator import PythonOperator
 from google.cloud import bigquery
@@ -16,7 +17,6 @@ from google.cloud.bigquery import TimePartitioning
 
 logging.basicConfig()
 logging.getLogger().setLevel(logging.DEBUG)
-
 
 # The following datasets must be created in BigQuery:
 # - ethereum_blockchain_raw
@@ -97,10 +97,10 @@ dag = models.DAG(
     default_args=default_dag_args)
 
 dags_folder = os.environ.get('DAGS_FOLDER', '/home/airflow/gcs/dags')
+output_bucket = os.environ.get('OUTPUT_BUCKET')
 
 
 def add_load_tasks(task, file_format, allow_quoted_newlines=False):
-    output_bucket = os.environ.get('OUTPUT_BUCKET')
     if output_bucket is None:
         raise ValueError('You must set OUTPUT_BUCKET environment variable')
 
@@ -239,7 +239,7 @@ enrich_transactions_task = add_enrich_tasks(
 enrich_logs_task = add_enrich_tasks(
     'logs', dependencies=[load_blocks_task, load_logs_task])
 enrich_contracts_task = add_enrich_tasks(
-    'contracts', dependencies=[load_blocks_task, load_contracts_task])
+    'contracts', dependencies=[load_blocks_task, load_contracts_task, load_receipts_task])
 enrich_tokens_task = add_enrich_tasks(
     'tokens', time_partitioning_field=None, dependencies=[load_tokens_task])
 enrich_token_transfers_task = add_enrich_tasks(
@@ -260,6 +260,29 @@ verify_traces_transactions_count_task = add_verify_tasks(
 verify_traces_contracts_count_task = add_verify_tasks(
     'traces_contracts_count', [enrich_transactions_task, enrich_traces_task])
 
+save_checkmark_task = bash_operator.BashOperator(
+    task_id='save_checkmark',
+    bash_command='touch checkmark.txt && ' 
+                 'gsutil cp checkmark.txt gs://{bucket}/load/checkmarks/block_date={datestamp}/checkmark.txt'
+        .format(bucket=output_bucket, datestamp='{{ds}}'),
+    execution_timeout=timedelta(minutes=10),
+    env=environment,
+    dag=dag
+)
+
+verify_blocks_count_task >> save_checkmark_task
+verify_blocks_have_latest_task >> save_checkmark_task
+verify_transactions_count_task >> save_checkmark_task
+verify_transactions_have_latest_task >> save_checkmark_task
+verify_logs_have_latest_task >> save_checkmark_task
+verify_token_transfers_have_latest_task >> save_checkmark_task
+verify_traces_blocks_count_task >> save_checkmark_task
+verify_traces_transactions_count_task >> save_checkmark_task
+verify_traces_contracts_count_task >> save_checkmark_task
+
+enrich_tokens_task >> save_checkmark_task
+enrich_contracts_task >> save_checkmark_task
+
 if notification_emails and len(notification_emails) > 0:
     send_email_task = EmailOperator(
         task_id='send_email',
@@ -268,12 +291,4 @@ if notification_emails and len(notification_emails) > 0:
         html_content='Ethereum ETL Airflow Load DAG Succeeded',
         dag=dag
     )
-    verify_blocks_count_task >> send_email_task
-    verify_blocks_have_latest_task >> send_email_task
-    verify_transactions_count_task >> send_email_task
-    verify_transactions_have_latest_task >> send_email_task
-    verify_logs_have_latest_task >> send_email_task
-    verify_token_transfers_have_latest_task >> send_email_task
-    verify_traces_blocks_count_task >> send_email_task
-    verify_traces_transactions_count_task >> send_email_task
-    verify_traces_contracts_count_task >> send_email_task
+    save_checkmark_task >> send_email_task
